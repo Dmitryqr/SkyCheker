@@ -1,0 +1,1008 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import customtkinter as ctk
+from PIL import Image, ImageTk
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+import os
+import glob
+import json
+import threading
+import time
+import pandas as pd
+from datetime import datetime
+
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
+
+
+class AdvancedDefectClassifier:
+    def __init__(self, model_path=None, device=None):
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = device
+
+        if model_path is None:
+            model_path = self._find_model()
+
+        self.model_path = model_path
+        self.model = None
+        self.class_names = ['crack', 'corrosion', 'normal']
+        self.transform = None
+
+        if model_path and os.path.exists(model_path):
+            self._load_model(model_path)
+        else:
+            raise FileNotFoundError("❌ Модель не найдена. Поместите файл модели (.pth) в папку models/")
+
+    def _find_model(self):
+        primary_paths = [
+            "models/первая модель.pth",
+            "models/модель.pth",
+            "первая модель.pth",
+            "модель.pth"
+        ]
+
+        for path in primary_paths:
+            if os.path.exists(path):
+                return path
+
+        for root, dirs, files in os.walk("."):
+            for file in files:
+                if file.endswith('.pth') or file.endswith('.pt'):
+                    if 'cache' in root or '__pycache__' in root:
+                        continue
+                    return os.path.join(root, file)
+
+        return None
+
+    def _load_model(self, model_path):
+        try:
+            json_path = model_path.replace('.pth', '.json').replace('.pt', '.json')
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                    if 'classes' in metadata:
+                        self.class_names = metadata['classes']
+                except:
+                    pass
+
+            try:
+                model = models.efficientnet_b3(weights=None)
+            except:
+                model = models.efficientnet_b3(pretrained=False)
+
+            num_features = model.classifier[1].in_features
+            model.classifier = nn.Sequential(
+                nn.Dropout(0.4),
+                nn.Linear(num_features, 512),
+                nn.ReLU(),
+                nn.BatchNorm1d(512),
+                nn.Dropout(0.3),
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.BatchNorm1d(256),
+                nn.Dropout(0.2),
+                nn.Linear(256, len(self.class_names))
+            )
+
+            try:
+                state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+                model.load_state_dict(state_dict)
+            except:
+                try:
+                    state_dict = torch.load(model_path, map_location=self.device)
+
+                    if 'state_dict' in state_dict:
+                        model.load_state_dict(state_dict['state_dict'])
+                    else:
+                        model.load_state_dict(state_dict)
+                except Exception:
+                    raise RuntimeError("Не удалось загрузить веса модели")
+
+            self.model = model
+            self.model.to(self.device)
+            self.model.eval()
+
+            self.transform = transforms.Compose([
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])
+
+        except Exception:
+            raise RuntimeError("Критическая ошибка загрузки модели")
+
+    def predict_image(self, image_path, confidence_threshold=0.6):
+        try:
+            if not os.path.exists(image_path):
+                return None, 0.0, None
+
+            if self.model is None:
+                raise RuntimeError("Модель не загружена")
+
+            image = Image.open(image_path).convert('RGB')
+            input_tensor = self.transform(image).unsqueeze(0).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model(input_tensor)
+                probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                confidence, predicted = torch.max(probabilities, 1)
+
+            if predicted.item() < len(self.class_names):
+                predicted_class = self.class_names[predicted.item()]
+            else:
+                predicted_class = "unknown"
+
+            confidence_value = confidence.item()
+
+            if confidence_value < confidence_threshold:
+                predicted_class = "uncertain"
+
+            return predicted_class, confidence_value, None
+
+        except Exception:
+            return None, 0.0, None
+
+
+class NeuralNetworkApp:
+    def __init__(self):
+        self.window = ctk.CTk()
+        self.window.title("SkyChecker: Анализ трещин и коррозии")
+        self.window.geometry("1400x800")
+
+        try:
+            self.window.tk.call('tk', 'scaling', 1.0)
+        except:
+            pass
+
+        self.title_font = ctk.CTkFont(size=28, weight="bold", family="Segoe UI")
+        self.heading_font = ctk.CTkFont(size=18, weight="bold", family="Segoe UI")
+        self.normal_font = ctk.CTkFont(size=12, family="Segoe UI")
+        self.small_font = ctk.CTkFont(size=11, family="Segoe UI")
+
+        self.classifier = None
+        self.model_status = "not_loaded"
+        self.model_loading = False
+
+        self.current_folder = None
+        self.image_files = []
+        self.results = []
+        self.stop_analysis_flag = False
+
+        self.colors = {
+            "primary": "#4a86e8",
+            "success": "#2e7d32",
+            "danger": "#c62828",
+            "warning": "#ff9800",
+            "light_bg": "#ffffff",
+            "dark_text": "#000000",
+            "gray_text": "#666666",
+            "border": "#dddddd",
+            "table_header": "#4a86e8",
+        }
+
+        self.setup_ui()
+        self.setup_status_bar()
+        self.window.after(500, self.load_model_in_background)
+
+    def load_model_in_background(self):
+        def load():
+            try:
+                self.window.after(0, lambda: self.update_model_status("🔄 Загрузка модели...", "#FF9800"))
+                self.window.after(0, lambda: self.status_bar.configure(text="Загрузка модели..."))
+
+                time.sleep(0.5)
+
+                self.classifier = AdvancedDefectClassifier()
+
+                self.model_status = "loaded"
+                self.window.after(0, lambda: self.update_model_status("✅ Модель загружена", "#2e7d32"))
+                self.window.after(0, lambda: self.status_bar.configure(text="Модель загружена, готов к работе"))
+
+            except Exception:
+                self.model_status = "error"
+                self.window.after(0, lambda: self.update_model_status("❌ Ошибка загрузки", "#c62828"))
+                self.window.after(0, lambda: self.status_bar.configure(text="Ошибка загрузки модели"))
+
+                self.window.after(0, self.ask_for_model_path)
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def ask_for_model_path(self):
+        response = messagebox.askretrycancel(
+            "Модель не найдена",
+            "Файл модели не найден. Хотите указать путь к модели вручную?"
+        )
+
+        if response:
+            self.select_model_file()
+
+    def select_model_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Выберите файл модели",
+            filetypes=[("PyTorch модели", "*.pth *.pt"), ("Все файлы", "*.*")]
+        )
+
+        if file_path:
+            try:
+                self.window.after(0, lambda: self.update_model_status("🔄 Загрузка модели...", "#FF9800"))
+                self.window.after(0, lambda: self.status_bar.configure(text="Загрузка модели..."))
+
+                self.classifier = AdvancedDefectClassifier(model_path=file_path)
+
+                self.model_status = "loaded"
+                self.window.after(0, lambda: self.update_model_status("✅ Модель загружена", "#2e7d32"))
+                self.window.after(0, lambda: self.status_bar.configure(text="Модель загружена, готов к работе"))
+
+                messagebox.showinfo("Успех", "Модель успешно загружена!")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось загрузить модель:\n{e}")
+
+    def update_model_status(self, text, color):
+        if hasattr(self, 'model_status_label'):
+            self.model_status_label.configure(text=text, text_color=color)
+
+    def setup_ui(self):
+        self.tabview = ctk.CTkTabview(self.window, fg_color=self.colors["light_bg"])
+        self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.tab_batch = self.tabview.add("📁 Пакетный анализ")
+        self.tab_single = self.tabview.add("🔍 Одиночный анализ")
+
+        self.setup_batch_tab()
+        self.setup_single_tab()
+
+    def setup_batch_tab(self):
+        main_container = ctk.CTkFrame(self.tab_batch, fg_color=self.colors["light_bg"])
+        main_container.pack(fill="both", expand=True, padx=5, pady=5)
+
+        left_panel = ctk.CTkFrame(main_container, width=350, fg_color=self.colors["light_bg"],
+                                  border_width=1, border_color=self.colors["border"])
+        left_panel.pack(side="left", fill="y", padx=(0, 10), pady=5)
+
+        right_panel = ctk.CTkFrame(main_container, fg_color=self.colors["light_bg"])
+        right_panel.pack(side="right", fill="both", expand=True, padx=5, pady=5)
+
+        ctk.CTkLabel(left_panel, text="Управление анализом",
+                     font=self.heading_font,
+                     text_color=self.colors["dark_text"]).pack(pady=20, padx=20)
+
+        model_frame = ctk.CTkFrame(left_panel, fg_color="#f0f7ff",
+                                   border_width=1, border_color="#c5d9f1")
+        model_frame.pack(fill="x", padx=15, pady=10)
+
+        ctk.CTkLabel(model_frame, text="Статус модели:",
+                     font=ctk.CTkFont(weight="bold"), text_color=self.colors["dark_text"]).pack(pady=(8, 2))
+
+        self.model_status_label = ctk.CTkLabel(model_frame, text="⏳ Загрузка...",
+                                               text_color="#FF9800",
+                                               font=ctk.CTkFont(size=13, weight="bold"))
+        self.model_status_label.pack(pady=(0, 8))
+
+        ctk.CTkButton(model_frame, text="🔄 Выбрать модель",
+                      command=self.select_model_file,
+                      height=30, fg_color="#8a2be2",
+                      text_color="white", font=ctk.CTkFont(size=12)).pack(pady=(0, 10), padx=20)
+
+        folder_frame = ctk.CTkFrame(left_panel, fg_color="#f9f9f9")
+        folder_frame.pack(fill="x", padx=15, pady=15)
+
+        ctk.CTkLabel(folder_frame, text="Папка с изображениями:",
+                     text_color=self.colors["dark_text"]).pack(pady=(10, 5))
+
+        self.folder_label = ctk.CTkLabel(folder_frame, text="Не выбрана",
+                                         text_color=self.colors["gray_text"], height=30,
+                                         fg_color="#f0f0f0", corner_radius=5)
+        self.folder_label.pack(fill="x", padx=10, pady=5)
+
+        ctk.CTkButton(folder_frame, text="📁 Выбрать папку",
+                      command=self.select_folder,
+                      height=38, fg_color=self.colors["primary"],
+                      text_color="white").pack(pady=10, padx=10)
+
+        settings_frame = ctk.CTkFrame(left_panel, fg_color="#f9f9f9")
+        settings_frame.pack(fill="x", padx=15, pady=15)
+
+        ctk.CTkLabel(settings_frame, text="Настройки анализа:",
+                     font=ctk.CTkFont(weight="bold"),
+                     text_color=self.colors["dark_text"]).pack(pady=(10, 10))
+
+        ctk.CTkLabel(settings_frame, text="Порог уверенности:",
+                     text_color=self.colors["dark_text"]).pack(anchor="w", padx=10)
+
+        self.confidence_slider = ctk.CTkSlider(settings_frame, from_=0, to=100,
+                                               number_of_steps=100,
+                                               progress_color=self.colors["primary"])
+        self.confidence_slider.set(60)
+        self.confidence_slider.pack(fill="x", padx=10, pady=5)
+
+        self.confidence_label = ctk.CTkLabel(settings_frame, text="60%",
+                                             text_color=self.colors["dark_text"])
+        self.confidence_label.pack()
+
+        self.confidence_slider.configure(command=self.update_confidence_label)
+
+        buttons_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
+        buttons_frame.pack(fill="x", padx=15, pady=20)
+
+        ctk.CTkButton(buttons_frame, text="▶️ Начать анализ",
+                      command=self.start_batch_analysis,
+                      height=45, fg_color=self.colors["success"],
+                      text_color="white", font=self.heading_font).pack(fill="x", pady=5)
+
+        self.stop_button = ctk.CTkButton(buttons_frame, text="⏸️ Остановить",
+                                         command=self.stop_analysis,
+                                         height=40, fg_color=self.colors["danger"],
+                                         text_color="white", state="disabled")
+        self.stop_button.pack(fill="x", pady=5)
+
+        ctk.CTkButton(buttons_frame, text="📊 Экспорт результатов",
+                      command=self.export_results,
+                      height=40, fg_color=self.colors["primary"],
+                      text_color="white").pack(fill="x", pady=5)
+
+        progress_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
+        progress_frame.pack(fill="x", padx=15, pady=20)
+
+        ctk.CTkLabel(progress_frame, text="Прогресс анализа:",
+                     text_color=self.colors["dark_text"]).pack(anchor="w")
+
+        self.progress_bar = ctk.CTkProgressBar(progress_frame,
+                                               progress_color=self.colors["primary"])
+        self.progress_bar.set(0)
+        self.progress_bar.pack(fill="x", pady=5)
+
+        self.progress_label = ctk.CTkLabel(progress_frame, text="Ожидание...",
+                                           text_color=self.colors["gray_text"])
+        self.progress_label.pack()
+
+        ctk.CTkLabel(right_panel, text="Результаты анализа",
+                     font=self.heading_font,
+                     text_color=self.colors["dark_text"]).pack(pady=15, anchor="w", padx=15)
+
+        self.create_results_table(right_panel)
+
+        preview_frame = ctk.CTkFrame(right_panel, height=220,
+                                     fg_color="#f9f9f9",
+                                     border_width=1,
+                                     border_color=self.colors["border"])
+        preview_frame.pack(fill="x", padx=15, pady=15)
+        preview_frame.pack_propagate(False)
+
+        ctk.CTkLabel(preview_frame, text="Предпросмотр изображения",
+                     font=ctk.CTkFont(weight="bold"),
+                     text_color=self.colors["dark_text"]).pack(pady=10)
+
+        self.preview_label = ctk.CTkLabel(preview_frame,
+                                          text="Выберите изображение в таблице",
+                                          text_color=self.colors["gray_text"])
+        self.preview_label.pack(expand=True)
+
+    def create_results_table(self, parent):
+        table_container = ctk.CTkFrame(parent, fg_color=self.colors["light_bg"])
+        table_container.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        self.results_tree = ttk.Treeview(
+            table_container,
+            columns=("file", "result", "confidence", "status", "time"),
+            show="headings",
+            height=12
+        )
+
+        columns = [
+            ("file", "Файл", 350),
+            ("result", "Результат", 150),
+            ("confidence", "Уверенность", 120),
+            ("status", "Статус", 180),
+            ("time", "Время", 100)
+        ]
+
+        for col_id, col_name, width in columns:
+            self.results_tree.heading(col_id, text=col_name)
+            self.results_tree.column(col_id, width=width, anchor="center")
+
+        vsb = ttk.Scrollbar(table_container, orient="vertical",
+                            command=self.results_tree.yview)
+        hsb = ttk.Scrollbar(table_container, orient="horizontal",
+                            command=self.results_tree.xview)
+
+        self.results_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.results_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        table_container.grid_rowconfigure(0, weight=1)
+        table_container.grid_columnconfigure(0, weight=1)
+
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        style.configure("Treeview",
+                        background=self.colors["light_bg"],
+                        foreground=self.colors["dark_text"],
+                        fieldbackground=self.colors["light_bg"],
+                        rowheight=30,
+                        font=('Segoe UI', 11),
+                        borderwidth=1,
+                        relief="solid")
+
+        style.configure("Treeview.Heading",
+                        background=self.colors["table_header"],
+                        foreground="white",
+                        relief="flat",
+                        font=('Segoe UI', 12, 'bold'),
+                        padding=10)
+
+        style.map("Treeview",
+                  background=[('selected', '#e6f2ff')],
+                  foreground=[('selected', self.colors["dark_text"])])
+
+        self.results_tree.tag_configure("critical",
+                                        background="#ffcccc",
+                                        foreground=self.colors["dark_text"])
+
+        self.results_tree.tag_configure("warning",
+                                        background="#fff2cc",
+                                        foreground=self.colors["dark_text"])
+
+        self.results_tree.tag_configure("normal",
+                                        background="#d9ead3",
+                                        foreground=self.colors["dark_text"])
+
+        self.results_tree.tag_configure("uncertain",
+                                        background="#f0f0f0",
+                                        foreground=self.colors["dark_text"])
+
+        self.results_tree.tag_configure("error",
+                                        background="#f8d7da",
+                                        foreground=self.colors["dark_text"])
+
+        self.results_tree.bind("<<TreeviewSelect>>", self.show_preview)
+
+    def setup_single_tab(self):
+        main_container = ctk.CTkFrame(self.tab_single, fg_color=self.colors["light_bg"])
+        main_container.pack(fill="both", expand=True, padx=5, pady=5)
+
+        left_panel = ctk.CTkFrame(main_container, width=400,
+                                  fg_color=self.colors["light_bg"])
+        left_panel.pack(side="left", fill="y", padx=(0, 10), pady=5)
+
+        right_panel = ctk.CTkFrame(main_container, fg_color=self.colors["light_bg"])
+        right_panel.pack(side="right", fill="both", expand=True, padx=5, pady=5)
+
+        ctk.CTkLabel(left_panel, text="Анализ одного изображения",
+                     font=self.heading_font,
+                     text_color=self.colors["dark_text"]).pack(pady=20, padx=20)
+
+        image_frame = ctk.CTkFrame(left_panel, height=300,
+                                   fg_color="#f0f0f0", corner_radius=10)
+        image_frame.pack(fill="x", padx=20, pady=15)
+        image_frame.pack_propagate(False)
+
+        self.single_image_label = ctk.CTkLabel(image_frame,
+                                               text="Загрузите изображение",
+                                               text_color=self.colors["gray_text"])
+        self.single_image_label.pack(expand=True)
+
+        ctk.CTkButton(left_panel, text="📁 Загрузить изображение",
+                      command=self.load_single_image,
+                      height=40, fg_color=self.colors["primary"],
+                      text_color="white").pack(pady=10, padx=20)
+
+        settings_frame = ctk.CTkFrame(left_panel, fg_color="#f9f9f9")
+        settings_frame.pack(fill="x", padx=20, pady=20)
+
+        ctk.CTkLabel(settings_frame, text="Порог уверенности:",
+                     text_color=self.colors["dark_text"]).pack(pady=(10, 5), padx=10)
+
+        self.single_confidence_slider = ctk.CTkSlider(settings_frame, from_=0, to=100,
+                                                      number_of_steps=100,
+                                                      progress_color=self.colors["primary"])
+        self.single_confidence_slider.set(60)
+        self.single_confidence_slider.pack(fill="x", padx=10, pady=5)
+
+        self.single_confidence_label = ctk.CTkLabel(settings_frame, text="60%",
+                                                    text_color=self.colors["dark_text"])
+        self.single_confidence_label.pack()
+
+        self.single_confidence_slider.configure(command=self.update_single_confidence_label)
+
+        ctk.CTkButton(left_panel, text="🔍 Анализировать изображение",
+                      command=self.analyze_single_image,
+                      height=45, fg_color=self.colors["success"],
+                      text_color="white", font=self.heading_font).pack(pady=20, padx=20, fill="x")
+
+        ctk.CTkLabel(right_panel, text="Результаты анализа",
+                     font=self.heading_font,
+                     text_color=self.colors["dark_text"]).pack(pady=20, padx=20, anchor="w")
+
+        results_frame = ctk.CTkFrame(right_panel, fg_color="#f9f9f9",
+                                     border_width=1, border_color=self.colors["border"])
+        results_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        self.result_text = ctk.CTkTextbox(results_frame, height=300,
+                                          font=self.normal_font,
+                                          text_color=self.colors["dark_text"])
+        self.result_text.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.result_text.insert("1.0", "Здесь будут отображаться результаты анализа...\n\n")
+        self.result_text.insert("end", "1. Загрузите изображение\n")
+        self.result_text.insert("end", "2. Нажмите 'Анализировать'\n")
+        self.result_text.insert("end", "3. Смотрите результаты здесь\n\n")
+        self.result_text.configure(state="disabled")
+
+    def setup_status_bar(self):
+        self.status_bar = ctk.CTkLabel(self.window, text="Загрузка интерфейса...",
+                                       anchor="w", font=self.small_font,
+                                       text_color=self.colors["dark_text"])
+        self.status_bar.pack(side="bottom", fill="x", padx=10, pady=5)
+
+    def update_confidence_label(self, value):
+        self.confidence_label.configure(text=f"{float(value):.0f}%")
+
+    def update_single_confidence_label(self, value):
+        self.single_confidence_label.configure(text=f"{float(value):.0f}%")
+
+    def select_folder(self):
+        folder_path = filedialog.askdirectory(title="Выберите папку с изображениями")
+        if folder_path:
+            self.current_folder = folder_path
+            folder_name = os.path.basename(folder_path)
+            self.folder_label.configure(text=folder_name[:30] + "..." if len(folder_name) > 30 else folder_name)
+            self.scan_folder()
+
+    def scan_folder(self):
+        if not self.current_folder:
+            return
+
+        extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.tif']
+        self.image_files = []
+
+        for ext in extensions:
+            self.image_files.extend(glob.glob(os.path.join(self.current_folder, ext)))
+            self.image_files.extend(glob.glob(os.path.join(self.current_folder, ext.upper())))
+
+        self.image_files = list(set(self.image_files))
+        self.image_files.sort()
+
+        count = len(self.image_files)
+        if count == 0:
+            messagebox.showwarning("Внимание", "В выбранной папке нет изображений!")
+            self.status_bar.configure(text="Папка не содержит изображений")
+        else:
+            messagebox.showinfo("Сканирование", f"Найдено {count} изображений")
+            self.status_bar.configure(text=f"Найдено {count} изображений")
+
+    def start_batch_analysis(self):
+        if not self.image_files:
+            messagebox.showwarning("Ошибка", "Сначала выберите папку с изображениями!")
+            return
+
+        if self.model_status != "loaded":
+            messagebox.showwarning("Ошибка", "Модель не загружена! Сначала загрузите модель.")
+            return
+
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
+        self.results = []
+
+        self.stop_analysis_flag = False
+        self.stop_button.configure(state="normal")
+
+        self.analysis_thread = threading.Thread(target=self.process_images)
+        self.analysis_thread.daemon = True
+        self.analysis_thread.start()
+
+    def process_images(self):
+        total = len(self.image_files)
+        processed = 0
+
+        threshold = self.confidence_slider.get() / 100.0
+
+        for image_path in self.image_files:
+            if self.stop_analysis_flag:
+                break
+
+            try:
+                result_dict = self.analyze_single_image_internal(image_path, threshold)
+                self.results.append(result_dict)
+
+                processed += 1
+                progress = processed / total
+
+                self.window.after(0, self.update_progress, progress, processed, total)
+                self.window.after(0, self.add_result_to_table, result_dict)
+
+                time.sleep(0.01)
+
+            except Exception:
+                error_result = {
+                    "file": os.path.basename(image_path),
+                    "result": "error",
+                    "confidence": 0,
+                    "status": "❌ Ошибка обработки",
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "path": image_path
+                }
+                self.window.after(0, self.add_result_to_table, error_result)
+
+        self.window.after(0, self.analysis_complete)
+
+    def analyze_single_image_internal(self, image_path, threshold=0.6):
+        result, confidence, _ = self.classifier.predict_image(image_path, threshold)
+
+        if result is None:
+            return {
+                "file": os.path.basename(image_path),
+                "result": "error",
+                "confidence": 0,
+                "status": "❌ Ошибка анализа",
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "path": image_path
+            }
+
+        if result == 'uncertain':
+            status = "❓ Неопределено"
+        elif result == 'crack':
+            if confidence > 0.8:
+                status = "⚠️ Критично (трещины)"
+            else:
+                status = "⚠️ Трещина"
+        elif result == 'corrosion':
+            if confidence > 0.8:
+                status = "⚠️ Критично (коррозия)"
+            else:
+                status = "⚠️ Коррозия"
+        elif result == 'normal':
+            status = "✅ Норма"
+        else:
+            status = f"❓ {result}"
+
+        return {
+            "file": os.path.basename(image_path),
+            "result": result,
+            "confidence": confidence,
+            "status": status,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "path": image_path
+        }
+
+    def update_progress(self, progress, current, total):
+        self.progress_bar.set(progress)
+        self.progress_label.configure(text=f"{current}/{total} ({progress * 100:.1f}%)")
+        self.status_bar.configure(text=f"Обработка: {current}/{total}")
+
+    def add_result_to_table(self, result):
+        if isinstance(result['confidence'], (int, float)):
+            confidence_str = f"{result['confidence'] * 100:.1f}%"
+        else:
+            confidence_str = str(result['confidence'])
+
+        item = self.results_tree.insert("", "end", values=(
+            result["file"],
+            result["result"],
+            confidence_str,
+            result["status"],
+            result["timestamp"]
+        ))
+
+        status = result["status"]
+        if "Критично" in status:
+            tag = "critical"
+        elif "⚠️" in status:
+            tag = "warning"
+        elif "✅" in status:
+            tag = "normal"
+        elif "❓" in status:
+            tag = "uncertain"
+        elif "❌" in status:  # ИСПРАВЛЕННАЯ СТРОКА: был русский "в", теперь английский "in"
+            tag = "error"
+        else:
+            tag = "normal"
+
+        self.results_tree.item(item, tags=(tag,))
+        self.results_tree.see(item)
+
+    def show_preview(self, event):
+        selection = self.results_tree.selection()
+        if not selection:
+            return
+
+        item = self.results_tree.item(selection[0])
+        filename = item['values'][0]
+
+        for result in self.results:
+            if result["file"] == filename:
+                image_path = result["path"]
+                break
+        else:
+            self.preview_label.configure(image="", text="Изображение не найдено")
+            return
+
+        try:
+            img = Image.open(image_path)
+            max_size = (400, 200)
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+
+            img_ctk = ctk.CTkImage(light_image=img, dark_image=img,
+                                   size=(img.width, img.height))
+
+            self.preview_label.configure(image=img_ctk, text="")
+            self.preview_label.image = img_ctk
+
+        except Exception:
+            self.preview_label.configure(image="", text="Ошибка загрузки изображения")
+
+    def stop_analysis(self):
+        self.stop_analysis_flag = True
+        self.stop_button.configure(state="disabled")
+        self.status_bar.configure(text="Анализ остановлен пользователем")
+
+    def analysis_complete(self):
+        self.stop_button.configure(state="disabled")
+
+        total = len(self.results)
+        success = sum(1 for r in self.results if r["result"] not in ["error", None])
+
+        self.status_bar.configure(text=f"Анализ завершен. Успешно: {success}/{total}")
+        messagebox.showinfo("Завершено",
+                            f"Анализ завершен!\n\n"
+                            f"Обработано изображений: {total}\n"
+                            f"Успешно проанализировано: {success}\n\n"
+                            f"Результаты доступны в таблице.")
+
+    def load_single_image(self):
+        file_path = filedialog.askopenfilename(
+            title="Выберите изображение для анализа",
+            filetypes=[
+                ("Изображения", "*.jpg *.jpeg *.png *.bmp *.tiff *.tif"),
+                ("Все файлы", "*.*")
+            ]
+        )
+
+        if file_path:
+            self.single_image_path = file_path
+            try:
+                img = Image.open(file_path)
+                max_size = (350, 300)
+                img.thumbnail(max_size, Image.Resampling.LANCZOS)
+
+                img_ctk = ctk.CTkImage(light_image=img, dark_image=img,
+                                       size=(img.width, img.height))
+
+                self.single_image_label.configure(image=img_ctk, text="")
+                self.single_image_label.image = img_ctk
+
+                self.status_bar.configure(text=f"Загружено: {os.path.basename(file_path)}")
+
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось загрузить изображение:\n{e}")
+
+    def analyze_single_image(self):
+        if not hasattr(self, 'single_image_path'):
+            messagebox.showwarning("Ошибка", "Сначала загрузите изображение!")
+            return
+
+        if self.model_status != "loaded":
+            messagebox.showwarning("Ошибка", "Модель не загружена! Сначала загрузите модель.")
+            return
+
+        try:
+            threshold = self.single_confidence_slider.get() / 100.0
+            result = self.analyze_single_image_internal(self.single_image_path, threshold)
+
+            self.result_text.configure(state="normal")
+            self.result_text.delete("1.0", "end")
+
+            result_text = f"{'=' * 50}\n"
+            result_text += "РЕЗУЛЬТАТЫ АНАЛИЗА\n"
+            result_text += f"{'=' * 50}\n\n"
+
+            result_text += f"📁 Файл: {result['file']}\n"
+            result_text += f"📊 Результат: {result['result'].upper()}\n"
+            result_text += f"🎯 Уверенность: {result['confidence'] * 100:.1f}%\n"
+            result_text += f"📈 Статус: {result['status']}\n"
+            result_text += f"⏰ Время анализа: {result['timestamp']}\n\n"
+
+            result_text += f"{'=' * 50}\n"
+            result_text += "РЕКОМЕНДАЦИИ\n"
+            result_text += f"{'=' * 50}\n\n"
+
+            if result['result'] == 'crack':
+                if result['confidence'] > 0.8:
+                    result_text += "🚨 ВЫСОКИЙ РИСК! Обнаружены четкие трещины.\n"
+                    result_text += "   Требуется немедленный осмотр специалиста и ремонт.\n"
+                else:
+                    result_text += "⚠️ Обнаружены возможные трещины.\n"
+                    result_text += "   Рекомендуется провести дополнительную проверку.\n"
+
+            elif result['result'] == 'corrosion':
+                if result['confidence'] > 0.8:
+                    result_text += "⚠️ СИЛЬНАЯ КОРРОЗИЯ! Обнаружена значительная коррозия.\n"
+                    result_text += "   Требуется очистка и обработка поверхности.\n"
+                else:
+                    result_text += "🟡 Обнаружена возможная коррозия.\n"
+                    result_text += "   Рекомендуется мониторинг состояния.\n"
+
+            elif result['result'] == 'normal':
+                result_text += "✅ Состояние в норме. Дефектов не обнаружено.\n"
+                result_text += "   Рекомендуется регулярный плановый осмотр.\n"
+
+            elif result['result'] == 'uncertain':
+                result_text += "❓ Неопределенный результат. Уверенность модели низкая.\n"
+                result_text += "   Рекомендуется провести ручную проверку.\n"
+
+            else:
+                result_text += "❓ Неизвестный результат.\n"
+                result_text += "   Требуется дополнительная проверка.\n"
+
+            self.result_text.insert("1.0", result_text)
+            self.result_text.configure(state="disabled")
+
+            self.status_bar.configure(text=f"Анализ завершен: {result['file']}")
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка анализа:\n{e}")
+
+    def export_results(self):
+        if not self.results:
+            messagebox.showwarning("Ошибка", "Нет данных для экспорта!")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="Экспорт результатов",
+            defaultextension=".xlsx",
+            filetypes=[
+                ("Excel файлы", "*.xlsx"),
+                ("CSV файлы", "*.csv"),
+                ("JSON файлы", "*.json"),
+                ("Текстовые файлы", "*.txt")
+            ]
+        )
+
+        if not file_path:
+            return
+
+        try:
+            export_data = []
+            for result in self.results:
+                export_data.append({
+                    "Файл": result["file"],
+                    "Результат": result["result"],
+                    "Уверенность": f"{result['confidence'] * 100:.1f}%" if isinstance(result['confidence'],
+                                                                                      (int, float)) else result[
+                        'confidence'],
+                    "Статус": result["status"],
+                    "Время анализа": result["timestamp"],
+                    "Путь": result.get("path", "")
+                })
+
+            df = pd.DataFrame(export_data)
+
+            if file_path.endswith('.xlsx'):
+                df.to_excel(file_path, index=False)
+            elif file_path.endswith('.csv'):
+                df.to_csv(file_path, index=False, encoding='utf-8-sig')
+            elif file_path.endswith('.json'):
+                df.to_json(file_path, orient='records', force_ascii=False, indent=2)
+            elif file_path.endswith('.txt'):
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write("=" * 60 + "\n")
+                    f.write("ОТЧЕТ АНАЛИЗА ДЕФЕКТОВ\n")
+                    f.write("=" * 60 + "\n\n")
+
+                    for item in export_data:
+                        f.write(f"Файл: {item['Файл']}\n")
+                        f.write(f"Результат: {item['Результат']}\n")
+                        f.write(f"Уверенность: {item['Уверенность']}\n")
+                        f.write(f"Статус: {item['Статус']}\n")
+                        f.write(f"Время: {item['Время анализа']}\n")
+                        f.write("-" * 40 + "\n")
+
+            messagebox.showinfo("Успех", f"Результаты успешно экспортированы в:\n{file_path}")
+            self.status_bar.configure(text=f"Экспорт завершен: {os.path.basename(file_path)}")
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при экспорте:\n{e}")
+
+    def reload_model(self):
+        self.status_bar.configure(text="Перезагрузка модели...")
+        self.model_status_label.configure(text="🔄 Загрузка...", text_color="#FF9800")
+
+        self.select_model_file()
+
+    def run(self):
+        self.window.mainloop()
+
+
+def main_menu():
+    menu_window = ctk.CTk()
+    menu_window.title("SkyChecker - Главное меню")
+    menu_window.geometry("500x450")
+
+    menu_window.update_idletasks()
+    width = menu_window.winfo_width()
+    height = menu_window.winfo_height()
+    x = (menu_window.winfo_screenwidth() // 2) - (width // 2)
+    y = (menu_window.winfo_screenheight() // 2) - (height // 2)
+    menu_window.geometry(f'{width}x{height}+{x}+{y}')
+
+    try:
+        menu_window.tk.call('tk', 'scaling', 1.0)
+    except:
+        pass
+
+    title_font = ctk.CTkFont(size=32, weight="bold", family="Segoe UI")
+    subtitle_font = ctk.CTkFont(size=16, family="Segoe UI")
+
+    ctk.CTkLabel(menu_window, text="SkyChecker",
+                 font=title_font, text_color="#4a86e8").pack(pady=40)
+
+    ctk.CTkLabel(menu_window, text="Анализ трещин и коррозии в материалах",
+                 font=subtitle_font, text_color="#666666").pack(pady=5)
+
+    model_exists = any([
+        os.path.exists("models/первая модель.pth"),
+        os.path.exists("models/модель.pth"),
+        os.path.exists("первая модель.pth"),
+        os.path.exists("модель.pth")
+    ])
+
+    for root, dirs, files in os.walk("."):
+        for file in files:
+            if file.endswith('.pth') or file.endswith('.pt'):
+                if 'cache' in root or '__pycache__' in root:
+                    continue
+                model_exists = True
+                break
+        if model_exists:
+            break
+
+    status_color = "#4CAF50" if model_exists else "#FF9800"
+    status_text = "✅ Модель доступна" if model_exists else "⚠️ Модель не найдена"
+
+    status_frame = ctk.CTkFrame(menu_window, fg_color="#f0f7ff", corner_radius=10)
+    status_frame.pack(pady=20, padx=40, fill="x")
+
+    ctk.CTkLabel(status_frame, text="Статус:",
+                 font=ctk.CTkFont(weight="bold"), text_color="#000000").pack(pady=(10, 2))
+    ctk.CTkLabel(status_frame, text=status_text, text_color=status_color,
+                 font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(0, 10))
+
+    start_button = ctk.CTkButton(
+        menu_window,
+        text="🚀 Запуск программы",
+        command=lambda: [menu_window.destroy(), NeuralNetworkApp().run()],
+        height=50,
+        width=250,
+        font=ctk.CTkFont(size=16, weight="bold"),
+        fg_color="#4a86e8",
+        hover_color="#3a76d8",
+        text_color="white"
+    )
+    start_button.pack(pady=30)
+
+    ctk.CTkButton(
+        menu_window,
+        text="Выход",
+        command=menu_window.destroy,
+        height=40,
+        width=150,
+        fg_color="#666666",
+        text_color="white"
+    ).pack(pady=10)
+
+    ctk.CTkLabel(menu_window, text="Версия 2.2 | 2026 SkyChecker",
+                 text_color="#999999").pack(side="bottom", pady=10)
+
+    menu_window.mainloop()
+
+
+if __name__ == "__main__":
+    main_menu()
