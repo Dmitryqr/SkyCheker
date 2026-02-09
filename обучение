@@ -1,0 +1,535 @@
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+import cv2
+import numpy as np
+import os
+import glob
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import random
+import shutil
+import datetime
+import json
+import warnings
+
+warnings.filterwarnings('ignore')
+
+class ImprovedDefectDetector:
+    def __init__(self, num_classes=3, model_name=None):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"🚀 Используется устройство: {self.device}")
+
+        if model_name is None:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.model_name = f"defect_model_{timestamp}"
+        else:
+            self.model_name = model_name
+
+        try:
+            weights = models.EfficientNet_B3_Weights.DEFAULT
+            self.model = models.efficientnet_b3(weights=weights)
+        except:
+            self.model = models.efficientnet_b3(pretrained=True)
+
+        num_features = self.model.classifier[1].in_features
+        self.model.classifier = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes)
+        )
+
+        self.model.to(self.device)
+        self.class_names = ['crack', 'corrosion', 'normal']
+
+        print(f"✅ Новая модель создана: {self.model_name}")
+
+    def get_transforms(self):
+        train_transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+
+        val_transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+
+        return train_transform, val_transform
+
+    def train_model(self, data_path=".", epochs=20, batch_size=8, save_path="models"):
+        from collections import Counter
+
+        os.makedirs(save_path, exist_ok=True)
+
+        image_paths = []
+        labels = []
+        label_map = {'crack': 0, 'corrosion': 1, 'normal': 2}
+
+        for category in self.class_names:
+            category_path = os.path.join(data_path, category, "*")
+            category_images = glob.glob(category_path)
+
+            for img_path in category_images:
+                if img_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    image_paths.append(img_path)
+                    labels.append(label_map[category])
+
+        print(f"📊 Найдено изображений: {len(image_paths)}")
+
+        if len(image_paths) < 30:
+            print("⚠️  Мало данных! Рекомендуется минимум 30 изображений")
+            if len(image_paths) == 0:
+                print("❌ Нет данных для обучения!")
+                return None
+
+        class_counts = Counter(labels)
+        print(f"📈 Распределение классов: {class_counts}")
+
+        train_paths, val_paths, train_labels, val_labels = self.split_data(
+            image_paths, labels, test_size=0.2
+        )
+
+        print(f"📚 Тренировочные: {len(train_paths)}, Валидационные: {len(val_paths)}")
+
+        train_transform, val_transform = self.get_transforms()
+
+        train_dataset = SimpleDataset(train_paths, train_labels, train_transform)
+        val_dataset = SimpleDataset(val_paths, val_labels, val_transform)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                  shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size,
+                                shuffle=False, num_workers=0)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
+
+        print(f"🎯 Начало обучения модели: {self.model_name}")
+        print("=" * 50)
+
+        best_accuracy = 0
+        patience_counter = 0
+        max_patience = 5
+
+        history = {
+            'train_loss': [], 'train_acc': [],
+            'val_loss': [], 'val_acc': []
+        }
+
+        for epoch in range(epochs):
+            self.model.train()
+            train_loss = 0
+            train_correct = 0
+            train_total = 0
+
+            for images, labels in train_loader:
+                images, labels = images.to(self.device), labels.to(self.device)
+
+                optimizer.zero_grad()
+                outputs = self.model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item()
+                _, predicted = outputs.max(1)
+                train_total += labels.size(0)
+                train_correct += predicted.eq(labels).sum().item()
+
+            train_accuracy = 100. * train_correct / train_total
+
+            self.model.eval()
+            val_loss = 0
+            val_correct = 0
+            val_total = 0
+
+            with torch.no_grad():
+                for images, labels in val_loader:
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    outputs = self.model(images)
+                    loss = criterion(outputs, labels)
+
+                    val_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    val_total += labels.size(0)
+                    val_correct += predicted.eq(labels).sum().item()
+
+            val_accuracy = 100. * val_correct / val_total
+            scheduler.step(val_accuracy)
+
+            history['train_loss'].append(train_loss / len(train_loader))
+            history['train_acc'].append(train_accuracy)
+            history['val_loss'].append(val_loss / len(val_loader))
+            history['val_acc'].append(val_accuracy)
+
+            print(f'Эпоха [{epoch + 1:2d}/{epochs}]')
+            print(f'  Тренировка: Потеря: {train_loss / len(train_loader):.4f}, '
+                  f'Точность: {train_accuracy:.2f}%')
+            print(f'  Валидация:  Потеря: {val_loss / len(val_loader):.4f}, '
+                  f'Точность: {val_accuracy:.2f}%')
+            print(f'  LR: {optimizer.param_groups[0]["lr"]:.6f}')
+
+            if val_accuracy > best_accuracy:
+                best_accuracy = val_accuracy
+                model_filename = f"{self.model_name}.pth"
+                model_path = os.path.join(save_path, model_filename)
+                torch.save(self.model.state_dict(), model_path)
+
+                metadata = {
+                    'model_name': self.model_name,
+                    'accuracy': best_accuracy,
+                    'epochs_trained': epoch + 1,
+                    'total_epochs': epochs,
+                    'batch_size': batch_size,
+                    'date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'classes': self.class_names,
+                    'data_size': len(image_paths)
+                }
+
+                with open(os.path.join(save_path, f"{self.model_name}.json"), 'w') as f:
+                    json.dump(metadata, f, indent=4)
+
+                print(f'  💾 Сохранена модель: {model_filename} '
+                      f'с точностью {val_accuracy:.2f}%')
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= max_patience:
+                    print(f"  ⏹️  Ранняя остановка на эпохе {epoch + 1}")
+                    break
+
+        print("=" * 50)
+        print(f'🎉 Обучение завершено! Лучшая точность: {best_accuracy:.2f}%')
+        print(f'📁 Модель сохранена в: {save_path}/')
+
+        return model_path
+
+    def split_data(self, image_paths, labels, test_size=0.2):
+        from collections import defaultdict
+
+        class_groups = defaultdict(list)
+        for path, label in zip(image_paths, labels):
+            class_groups[label].append(path)
+
+        train_paths, train_labels = [], []
+        val_paths, val_labels = [], []
+
+        for label, paths in class_groups.items():
+            random.shuffle(paths)
+            val_count = max(1, int(len(paths) * test_size))
+
+            val_paths.extend(paths[:val_count])
+            val_labels.extend([label] * val_count)
+            train_paths.extend(paths[val_count:])
+            train_labels.extend([label] * (len(paths) - val_count))
+
+        return train_paths, val_paths, train_labels, val_labels
+
+class SimpleDataset(Dataset):
+    def __init__(self, image_paths, labels, transform=None):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        try:
+            image = Image.open(self.image_paths[idx]).convert('RGB')
+            label = self.labels[idx]
+
+            if self.transform:
+                image = self.transform(image)
+
+            return image, label
+        except Exception as e:
+            print(f"Ошибка загрузки {self.image_paths[idx]}: {e}")
+            return torch.zeros(3, 256, 256), 0
+
+def check_data_structure():
+    print("🔍 ПРОВЕРКА СТРУКТУРЫ ДАННЫХ")
+    print("=" * 40)
+
+    categories = ['crack', 'corrosion', 'normal']
+    total_images = 0
+
+    for category in categories:
+        if os.path.exists(category):
+            images = [f for f in os.listdir(category)
+                      if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            count = len(images)
+            total_images += count
+            print(f"📁 {category}: {count} изображений")
+
+            if images:
+                for img in images[:3]:
+                    print(f"    ├── {img}")
+                if len(images) > 3:
+                    print(f"    └── ... и еще {len(images) - 3}")
+        else:
+            print(f"❌ {category}: папка не найдена")
+
+    print(f"\n📊 Всего изображений: {total_images}")
+
+    if total_images == 0:
+        print("\n⚠️  НЕТ ДАННЫХ ДЛЯ ОБУЧЕНИЯ!")
+        print("Создайте папки 'crack', 'corrosion', 'normal' и добавьте изображения")
+        return False
+    elif total_images < 30:
+        print("\n⚠️  МАЛО ДАННЫХ!")
+        print("Рекомендуется минимум 30 изображений (по 10 на каждый класс)")
+        return True
+    else:
+        print("\n✅ Данные готовы для обучения!")
+        return True
+
+def create_sample_data():
+    print("🧪 СОЗДАНИЕ ТЕСТОВЫХ ДАННЫХ")
+    print("=" * 40)
+
+    categories = ['crack', 'corrosion', 'normal']
+
+    for category in categories:
+        os.makedirs(category, exist_ok=True)
+
+        for i in range(5):
+            if category == 'crack':
+                img = np.random.randint(100, 150, (256, 256, 3), dtype=np.uint8)
+                cv2.line(img, (50, 50), (200, 200), (50, 50, 50), 3)
+            elif category == 'corrosion':
+                img = np.random.randint(150, 200, (256, 256, 3), dtype=np.uint8)
+                cv2.circle(img, (128, 128), 30, (100, 100, 100), -1)
+            else:
+                img = np.random.randint(200, 255, (256, 256, 3), dtype=np.uint8)
+
+            filename = os.path.join(category, f"sample_{i + 1}.jpg")
+            cv2.imwrite(filename, img)
+            print(f"✅ Создано: {filename}")
+
+    print("\n🎉 Тестовые данные созданы!")
+
+def load_and_test_model(model_path=None):
+    if model_path is None:
+        if os.path.exists("models"):
+            model_files = [f for f in os.listdir("models") if f.endswith('.pth')]
+            if model_files:
+                model_files.sort(reverse=True)
+                model_path = os.path.join("models", model_files[0])
+            else:
+                print("❌ Модели не найдены!")
+                return
+
+    print(f"🧪 Тестирование модели: {os.path.basename(model_path)}")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = models.efficientnet_b3(pretrained=False)
+    num_features = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.4),
+        nn.Linear(num_features, 512),
+        nn.ReLU(),
+        nn.BatchNorm1d(512),
+        nn.Dropout(0.3),
+        nn.Linear(512, 256),
+        nn.ReLU(),
+        nn.BatchNorm1d(256),
+        nn.Dropout(0.2),
+        nn.Linear(256, 3)
+    )
+
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.to(device)
+    model.eval()
+
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+    test_image = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
+    test_path = "test_temp.jpg"
+    cv2.imwrite(test_path, test_image)
+
+    image = Image.open(test_path).convert('RGB')
+    input_tensor = transform(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = model(input_tensor)
+        probabilities = torch.nn.functional.softmax(output, dim=1)
+        confidence, predicted = torch.max(probabilities, 1)
+
+    class_names = ['crack', 'corrosion', 'normal']
+    print(f"📊 Результат: {class_names[predicted.item()]}")
+    print(f"🎯 Уверенность: {confidence.item():.2%}")
+
+    if os.path.exists(test_path):
+        os.remove(test_path)
+
+def list_models():
+    if not os.path.exists("models"):
+        print("📁 Папка 'models' не найдена")
+        return
+
+    model_files = [f for f in os.listdir("models") if f.endswith('.pth')]
+
+    if not model_files:
+        print("📁 Модели не найдены")
+        return
+
+    print("📋 ДОСТУПНЫЕ МОДЕЛИ:")
+    print("=" * 50)
+
+    for model_file in model_files:
+        json_file = model_file.replace('.pth', '.json')
+        json_path = os.path.join("models", json_file)
+
+        if os.path.exists(json_path):
+            with open(json_path, 'r') as f:
+                metadata = json.load(f)
+
+            print(f"🏷️  Модель: {metadata.get('model_name', 'Unknown')}")
+            print(f"   📅 Дата: {metadata.get('date', 'Unknown')}")
+            print(f"   🎯 Точность: {metadata.get('accuracy', 0):.2f}%")
+            print(f"   📊 Данных: {metadata.get('data_size', 0)} изображений")
+            print("   ─" * 20)
+        else:
+            print(f"🏷️  Модель: {model_file} (без метаданных)")
+            print("   ─" * 20)
+
+def main_menu():
+    print("🤖 СИСТЕМА ОБНАРУЖЕНИЯ ДЕФЕКТОВ")
+    print("=" * 50)
+
+    while True:
+        print("\n📋 ГЛАВНОЕ МЕНЮ:")
+        print("1. 📊 Проверить данные")
+        print("2. 🆕 Обучить новую модель")
+        print("3. 🧪 Протестировать модель")
+        print("4. 📋 Список моделей")
+        print("5. 🧪 Создать тестовые данные")
+        print("6. 🚪 Выход")
+
+        choice = input("\nВыберите действие (1-6): ").strip()
+
+        if choice == '1':
+            check_data_structure()
+
+        elif choice == '2':
+            if not check_data_structure():
+                create = input("\nСоздать тестовые данные? (y/n): ").lower()
+                if create == 'y':
+                    create_sample_data()
+                else:
+                    print("❌ Невозможно обучить без данных!")
+                    continue
+
+            model_name = input("\nВведите имя модели (Enter для авто): ").strip()
+            if not model_name:
+                model_name = None
+
+            try:
+                epochs = int(input("Количество эпох (по умолчанию 20): ") or "20")
+                batch_size = int(input("Размер батча (по умолчанию 8): ") or "8")
+            except:
+                epochs = 20
+                batch_size = 8
+
+            print("\n🚀 Запуск обучения...")
+            detector = ImprovedDefectDetector(model_name=model_name)
+            detector.train_model(epochs=epochs, batch_size=batch_size)
+
+        elif choice == '3':
+            list_models()
+
+            if os.path.exists("models"):
+                model_files = [f for f in os.listdir("models") if f.endswith('.pth')]
+                if model_files:
+                    try:
+                        model_num = int(input("\nВыберите модель по номеру (1 для последней): ") or "1")
+                        model_files.sort(reverse=True)
+                        selected = model_files[min(model_num - 1, len(model_files) - 1)]
+                        load_and_test_model(os.path.join("models", selected))
+                    except:
+                        load_and_test_model()
+
+        elif choice == '4':
+            list_models()
+
+        elif choice == '5':
+            confirm = input("\n⚠️  Создать тестовые данные? Существующие файлы не будут удалены. (y/n): ").lower()
+            if confirm == 'y':
+                create_sample_data()
+
+        elif choice == '6':
+            print("\n👋 До свидания!")
+            break
+
+        else:
+            print("❌ Неверный выбор!")
+
+def install_requirements():
+    print("📦 УСТАНОВКА БИБЛИОТЕК")
+    print("=" * 40)
+
+    requirements = [
+        'torch',
+        'torchvision',
+        'opencv-python',
+        'Pillow',
+        'numpy',
+        'matplotlib',
+        'seaborn',
+        'scikit-learn'
+    ]
+
+    import subprocess
+    import sys
+
+    for package in requirements:
+        print(f"Установка {package}...")
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
+            print(f"✅ {package} установлен")
+        except:
+            print(f"⚠️  Не удалось установить {package}")
+
+    print("\n🎉 Все библиотеки установлены!")
+
+if __name__ == "__main__":
+    try:
+        import torch
+        import torchvision
+
+        print(f"✅ PyTorch {torch.__version__} установлен")
+    except ImportError:
+        print("❌ PyTorch не установлен")
+        install = input("Установить автоматически? (y/n): ").lower()
+        if install == 'y':
+            install_requirements()
+        else:
+            print("Установите библиотеки командой: pip install torch torchvision opencv-python pillow numpy")
+            exit()
+
+    main_menu()
